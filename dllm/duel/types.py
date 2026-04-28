@@ -6,6 +6,24 @@ import torch
 
 
 @dataclass
+class DuelProposalResult:
+    """Result from DUEL proposal sampling.
+
+    Iteration yields (sequence, trace) for compatibility with the previous
+    two-value return convention.
+    """
+
+    sequence: torch.Tensor
+    trace: dict | None
+    log_q: torch.Tensor
+    per_step_logprobs: list[float] = field(default_factory=list)
+
+    def __iter__(self):
+        yield self.sequence
+        yield self.trace
+
+
+@dataclass
 class DuelDiagnostics:
     """Diagnostics recorded for a single MTM step."""
 
@@ -15,7 +33,9 @@ class DuelDiagnostics:
     rollback_positions: list[int] = field(default_factory=list)
     selected_index: int = -1
     forward_loglikelihoods: list[float] = field(default_factory=list)
+    forward_log_qs: list[float] = field(default_factory=list)
     backward_loglikelihoods: list[float] = field(default_factory=list)
+    backward_log_qs: list[float] = field(default_factory=list)
     forward_log_weights: list[float] = field(default_factory=list)
     backward_log_weights: list[float] = field(default_factory=list)
     log_W_fwd: float = float("-inf")
@@ -36,7 +56,9 @@ class DuelDiagnostics:
             "rollback_positions": self.rollback_positions,
             "selected_index": self.selected_index,
             "forward_loglikelihoods": self.forward_loglikelihoods,
+            "forward_log_qs": self.forward_log_qs,
             "backward_loglikelihoods": self.backward_loglikelihoods,
+            "backward_log_qs": self.backward_log_qs,
             "forward_log_weights": self.forward_log_weights,
             "backward_log_weights": self.backward_log_weights,
             "log_W_fwd": self.log_W_fwd,

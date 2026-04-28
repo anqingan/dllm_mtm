@@ -52,10 +52,11 @@ def test_duel_disabled_matches_baseline_path():
 
 def test_duel_enabled_records_diagnostics():
     enabled = _sample_with(
-        DuelMTMConfig(
-            enabled=True,
-            method="duel_rerank",
-            K=2,
+            DuelMTMConfig(
+                enabled=True,
+                method="duel_rerank",
+                exact_mtm=False,
+                K=2,
             block_size=2,
             rollback_ratio=0.5,
             unmask_rule="left_to_right",

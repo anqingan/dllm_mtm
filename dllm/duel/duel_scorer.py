@@ -25,6 +25,8 @@ def compute_duel_conditional_loglikelihood(
     unmask_rule: str,
     positions_per_step: int,
     mask_token_id: int,
+    target_temperature: float = 1.0,
+    forbid_mask_token: bool = True,
     attention_mask: torch.Tensor | None = None,
     position_ids: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
@@ -35,6 +37,9 @@ def compute_duel_conditional_loglikelihood(
     Returns (total_log_likelihood_scalar, diagnostics_dict_or_None).
     total_log_likelihood has shape [] (scalar).
     """
+    if target_temperature <= 0.0:
+        raise ValueError("target_temperature must be positive")
+
     z = initial_state.clone()
     B, T = z.shape
     assert B == 1, "DUEL scorer currently requires batch_size=1"
@@ -66,7 +71,11 @@ def compute_duel_conditional_loglikelihood(
         if position_ids is not None:
             fwd_kwargs["position_ids"] = position_ids
         logits = model(z, **fwd_kwargs).logits  # [1, T, V]
-        log_probs = F.log_softmax(logits, dim=-1)  # [1, T, V]
+        target_logits = logits / target_temperature
+        if forbid_mask_token:
+            target_logits = target_logits.clone()
+            target_logits[:, :, mask_token_id] = -torch.inf
+        log_probs = F.log_softmax(target_logits, dim=-1)  # [1, T, V]
 
         # Select positions deterministically
         positions_per_sample = select_positions(

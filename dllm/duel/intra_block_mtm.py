@@ -14,7 +14,7 @@ import torch
 
 from dllm.duel.block_utils import make_block_mask, make_rollback_state
 from dllm.duel.config import DuelMTMConfig
-from dllm.duel.duel_sampler import duel_generate_region
+from dllm.duel.duel_sampler import compute_duel_proposal_logprob, duel_generate_region
 from dllm.duel.duel_scorer import compute_duel_conditional_loglikelihood
 from dllm.duel.types import DuelDiagnostics
 
@@ -52,6 +52,8 @@ class IntraBlockDuelMTM:
         Positions outside [block_start, block_end) are never modified.
         """
         cfg = self.config
+        proposal_top_k = cfg.proposal_top_k
+        proposal_top_p = cfg.proposal_top_p
         T = current_state.shape[1]
         block_mask = make_block_mask(
             T, block_start, block_end, device=current_state.device
@@ -95,31 +97,33 @@ class IntraBlockDuelMTM:
         forward_candidates = []
         forward_lls = []
         for _k in range(cfg.K):
-            candidate, _ = duel_generate_region(
+            proposal = duel_generate_region(
                 model=self.model,
                 initial_state=rollback_state.clone(),
                 generation_mask=rollback_mask.clone(),
                 unmask_rule=cfg.unmask_rule,
                 positions_per_step=cfg.positions_per_step,
                 mask_token_id=self.mask_token_id,
-                temperature=cfg.temperature,
-                top_k=cfg.top_k,
-                top_p=cfg.top_p,
+                temperature=cfg.proposal_temperature,
+                top_k=proposal_top_k,
+                top_p=proposal_top_p,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 generator=generator,
             )
+            candidate = proposal.sequence
             # Sanity: block-external tokens unchanged
             assert not (
                 (candidate != current_state) & ~block_mask
             ).any(), "Candidate modified tokens outside the block"
-            forward_candidates.append(candidate)
+            forward_candidates.append((candidate, proposal.log_q))
 
         # 3. Forward scoring — use candidate_mask = only positions that
         #    the generator was asked to fill (rollback_mask & originally masked).
         #    This matches exactly what duel_generate_region produces.
         scoring_candidate_mask = candidate_mask.clone()
-        for candidate in forward_candidates:
+        forward_log_qs = []
+        for candidate, log_q in forward_candidates:
             ll, _ = compute_duel_conditional_loglikelihood(
                 model=self.model,
                 initial_state=rollback_state,
@@ -129,13 +133,18 @@ class IntraBlockDuelMTM:
                 unmask_rule=cfg.unmask_rule,
                 positions_per_step=cfg.positions_per_step,
                 mask_token_id=self.mask_token_id,
+                target_temperature=cfg.target_temperature,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
             )
             forward_lls.append(ll.item())
+            forward_log_qs.append(log_q.item())
 
         diag.forward_loglikelihoods = forward_lls
-        forward_log_weights = [(cfg.beta - 1.0) * ll for ll in forward_lls]
+        diag.forward_log_qs = forward_log_qs
+        forward_log_weights = [
+            cfg.alpha * ll - log_q for ll, log_q in zip(forward_lls, forward_log_qs)
+        ]
         diag.forward_log_weights = forward_log_weights
 
         # 4. Select y_star
@@ -145,14 +154,14 @@ class IntraBlockDuelMTM:
             diag.accept_prob = 1.0
             diag.accepted = True
             diag.elapsed_time = time.perf_counter() - t0
-            return forward_candidates[selected_index], diag
+            return forward_candidates[selected_index][0], diag
 
         # method == "duel_mtm"
         log_w_tensor = torch.tensor(forward_log_weights)
         probs = torch.softmax(log_w_tensor, dim=0)
         selected_index = int(torch.multinomial(probs, 1, generator=generator).item())
         diag.selected_index = selected_index
-        selected_state = forward_candidates[selected_index]
+        selected_state = forward_candidates[selected_index][0]
 
         # 5. Backward reference set
         # Re-mask the rollback region of selected_state
@@ -165,26 +174,41 @@ class IntraBlockDuelMTM:
 
         # Generate K-1 auxiliary backward candidates
         for _k in range(cfg.K - 1):
-            bwd_cand, _ = duel_generate_region(
+            bwd_proposal = duel_generate_region(
                 model=self.model,
                 initial_state=bwd_initial.clone(),
                 generation_mask=rollback_mask.clone(),
                 unmask_rule=cfg.unmask_rule,
                 positions_per_step=cfg.positions_per_step,
                 mask_token_id=self.mask_token_id,
-                temperature=cfg.temperature,
-                top_k=cfg.top_k,
-                top_p=cfg.top_p,
+                temperature=cfg.proposal_temperature,
+                top_k=proposal_top_k,
+                top_p=proposal_top_p,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 generator=generator,
             )
-            backward_candidates.append(bwd_cand)
+            backward_candidates.append((bwd_proposal.sequence, bwd_proposal.log_q))
 
         # Add original current_state as the K-th backward candidate
-        backward_candidates.append(current_state)
+        current_log_q = compute_duel_proposal_logprob(
+            model=self.model,
+            initial_state=bwd_initial,
+            target_state=current_state,
+            generation_mask=bwd_candidate_mask,
+            unmask_rule=cfg.unmask_rule,
+            positions_per_step=cfg.positions_per_step,
+            mask_token_id=self.mask_token_id,
+            proposal_temperature=cfg.proposal_temperature,
+            top_k=proposal_top_k,
+            top_p=proposal_top_p,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        backward_candidates.append((current_state, current_log_q))
 
-        for bwd_cand in backward_candidates:
+        backward_log_qs = []
+        for bwd_cand, log_q in backward_candidates:
             ll, _ = compute_duel_conditional_loglikelihood(
                 model=self.model,
                 initial_state=bwd_initial,
@@ -194,13 +218,18 @@ class IntraBlockDuelMTM:
                 unmask_rule=cfg.unmask_rule,
                 positions_per_step=cfg.positions_per_step,
                 mask_token_id=self.mask_token_id,
+                target_temperature=cfg.target_temperature,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
             )
             backward_lls.append(ll.item())
+            backward_log_qs.append(log_q.item())
 
         diag.backward_loglikelihoods = backward_lls
-        backward_log_weights = [(cfg.beta - 1.0) * ll for ll in backward_lls]
+        diag.backward_log_qs = backward_log_qs
+        backward_log_weights = [
+            cfg.alpha * ll - log_q for ll, log_q in zip(backward_lls, backward_log_qs)
+        ]
         diag.backward_log_weights = backward_log_weights
 
         # 6. MTM accept/reject

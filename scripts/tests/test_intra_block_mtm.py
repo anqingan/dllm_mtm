@@ -40,13 +40,14 @@ class TestIntraBlockDuelMTM:
         cfg = DuelMTMConfig(
             enabled=True,
             method="duel_rerank",
+            exact_mtm=False,
             K=2,
             beta=4.0,
             block_size=4,
             rollback_ratio=0.5,
             unmask_rule="left_to_right",
             positions_per_step=1,
-            temperature=0.0,
+            proposal_temperature=1.0,
         )
         mtm = IntraBlockDuelMTM(self.model, cfg, MASK_ID)
         # state: [fixed, fixed, fixed | block: 0 0 0 0 | fixed]
@@ -70,13 +71,14 @@ class TestIntraBlockDuelMTM:
         cfg = DuelMTMConfig(
             enabled=True,
             method="duel_rerank",
+            exact_mtm=False,
             K=3,
             beta=4.0,
             block_size=4,
             rollback_ratio=0.5,
             unmask_rule="left_to_right",
             positions_per_step=1,
-            temperature=0.0,
+            proposal_temperature=1.0,
         )
         mtm = IntraBlockDuelMTM(self.model, cfg, MASK_ID)
         state = torch.tensor([[1, 0, 0, 0, 0, 6]])
@@ -102,7 +104,7 @@ class TestIntraBlockDuelMTM:
             rollback_ratio=0.5,
             unmask_rule="left_to_right",
             positions_per_step=1,
-            temperature=0.0,
+            proposal_temperature=1.0,
         )
         mtm = IntraBlockDuelMTM(self.model, cfg, MASK_ID)
         state = torch.tensor([[1, 2, 0, 0, 0, 0, 7]])
@@ -123,7 +125,7 @@ class TestIntraBlockDuelMTM:
             rollback_ratio=0.5,
             unmask_rule="left_to_right",
             positions_per_step=1,
-            temperature=0.0,
+            proposal_temperature=1.0,
         )
         mtm = IntraBlockDuelMTM(self.model, cfg, MASK_ID)
         state = torch.tensor([[1, 0, 0, 0, 0, 6]])
@@ -144,7 +146,7 @@ class TestIntraBlockDuelMTM:
             rollback_ratio=0.5,
             unmask_rule="left_to_right",
             positions_per_step=1,
-            temperature=0.0,
+            proposal_temperature=1.0,
         )
         mtm = IntraBlockDuelMTM(self.model, cfg, MASK_ID)
         state = torch.tensor([[1, 0, 0, 0, 0, 6]])
@@ -174,7 +176,7 @@ class TestIntraBlockDuelMTM:
             rollback_ratio=0.5,
             unmask_rule="left_to_right",
             positions_per_step=1,
-            temperature=0.0,
+            proposal_temperature=1.0,
         )
         results = []
         for _ in range(2):
@@ -202,7 +204,7 @@ class TestIntraBlockDuelMTM:
             rollback_ratio=0.5,
             unmask_rule="left_to_right",
             positions_per_step=1,
-            temperature=0.0,
+            proposal_temperature=1.0,
         )
         mtm = IntraBlockDuelMTM(self.model, cfg, MASK_ID)
         state = torch.tensor([[0, 0, 0, 0, 8, 9, 10]])
