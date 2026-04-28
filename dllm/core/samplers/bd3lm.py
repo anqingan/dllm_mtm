@@ -4,13 +4,49 @@ reference: https://github.com/ML-GSAI/LLaDA/blob/main/generate.py
 
 import copy
 import math
+import warnings
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 
 from dllm.core.samplers.base import BaseSampler, BaseSamplerConfig, BaseSamplerOutput
-from dllm.core.samplers.utils import add_gumbel_noise, get_num_transfer_tokens
+from dllm.core.samplers.utils import (
+    add_gumbel_noise,
+    compute_confidence_scores,
+    compute_kl_divergence,
+    get_num_transfer_tokens,
+    select_transfer_positions,
+)
+from dllm.duel.config import DuelMTMConfig
+from dllm.duel.diagnostics import save_diagnostics
+from dllm.duel.intra_block_mtm import IntraBlockDuelMTM
+
+
+def _normalise_duel_mtm_config(
+    config: DuelMTMConfig | dict | None,
+) -> DuelMTMConfig:
+    if config is None:
+        return DuelMTMConfig(enabled=False)
+    if isinstance(config, DuelMTMConfig):
+        return config
+    if isinstance(config, dict):
+        inter_keys = [key for key in config if "inter" in key.lower()]
+        if inter_keys:
+            raise ValueError(
+                "Inter-block MTM is intentionally disabled in DUEL-guided "
+                "Intra-Block MTM."
+            )
+        return DuelMTMConfig(**config)
+    raise TypeError("duel_mtm must be a DuelMTMConfig, dict, or None")
+
+
+def _make_duel_generator(cfg: DuelMTMConfig, device: torch.device) -> torch.Generator:
+    try:
+        generator = torch.Generator(device=device)
+    except RuntimeError:
+        generator = torch.Generator()
+    return generator.manual_seed(cfg.seed)
 
 
 def _prepare_for_sampling(
@@ -88,50 +124,54 @@ def _diffusion_step_block(
     num_transfer_step: torch.Tensor,  # [B]
     temperature: float,
     remasking: str,
-) -> torch.Tensor:
+    threshold: float | None = None,
+    kl_threshold: float | None = None,
+    prev_block_probs: torch.Tensor | None = None,  # [B, L, V] for KLASS
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     One diffusion step over a block slice [B, L].
+
+    Returns:
+        x_block_new: [B, L] updated block tokens.
+        current_probs: [B, L, V] softmax distribution (for KLASS state), or None.
     """
     B, L, _ = logits.shape
     device = logits.device
 
     if not mask_block.any():
-        return x_block
+        return x_block, None
 
     # Gumbel-max sampling
     logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
     x0 = torch.argmax(logits_with_noise, dim=-1)  # [B, L]
 
-    # Confidence
-    if remasking == "low_confidence":
-        p = F.softmax(logits, dim=-1)
-        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)  # [B, L]
-    elif remasking == "random":
-        x0_p = torch.rand((B, L), device=device)
-    else:
-        raise NotImplementedError(remasking)
+    # --- Compute confidence scores via unified helper ---
+    x0_p, current_probs = compute_confidence_scores(logits, x0, remasking)
 
     # Only masked positions can change
     x0 = torch.where(mask_block, x0, x_block)
     neg_inf = torch.full_like(x0_p, -float("inf"))
     confidence = torch.where(mask_block, x0_p, neg_inf)
 
-    # Pick positions to commit
-    transfer = torch.zeros_like(x0, dtype=torch.bool)  # [B, L]
-    for j in range(B):
-        k = int(num_transfer_step[j].item())
-        if k <= 0:
-            continue
-        valid_count = (confidence[j] > -float("inf")).sum().item()
-        if valid_count == 0:
-            continue
-        k = min(k, valid_count)
-        _, sel = torch.topk(confidence[j], k)
-        transfer[j, sel] = True
+    # --- KL divergence for KLASS ---
+    kl_div = None
+    if remasking == "klass" and prev_block_probs is not None and current_probs is not None:
+        kl_div = compute_kl_divergence(prev_block_probs, current_probs)
+
+    # --- Select positions to unmask via unified helper ---
+    transfer = select_transfer_positions(
+        confidence=confidence,
+        mask_index=mask_block,
+        num_transfer_tokens=num_transfer_step,
+        remasking=remasking,
+        threshold=threshold,
+        kl_threshold=kl_threshold,
+        kl_divergence=kl_div,
+    )
 
     x_block_new = x_block.clone()
     x_block_new[transfer] = x0[transfer]
-    return x_block_new
+    return x_block_new, current_probs
 
 
 @dataclass
@@ -149,6 +189,11 @@ class BD3LMSamplerConfig(BaseSamplerConfig):
     cfg_scale: float = 0.0
     cfg_keep_tokens: list[int] | None = None
     right_shift_logits: bool = False
+    # --- New strategy parameters ---
+    threshold: float | None = None  # confidence threshold for confidence_threshold / klass
+    kl_threshold: float | None = None  # nu for KL divergence ceiling in klass
+    oracle_max_positions: int = 5  # max masked positions for oracle enumeration
+    duel_mtm: DuelMTMConfig | dict | None = None
 
 
 @dataclass
@@ -194,6 +239,14 @@ class BD3LMSampler(BaseSampler):
         )
         return_dict = kwargs.get("return_dict", config.return_dict)
         right_shift_logits = kwargs.get("right_shift_logits", config.right_shift_logits)
+        threshold = kwargs.get("threshold", config.threshold)
+        kl_threshold = kwargs.get("kl_threshold", config.kl_threshold)
+        oracle_max_positions = kwargs.get(
+            "oracle_max_positions", config.oracle_max_positions
+        )
+        duel_mtm_cfg = _normalise_duel_mtm_config(
+            kwargs.get("duel_mtm", config.duel_mtm)
+        )
 
         assert block_size >= 1
         assert steps >= 1
@@ -262,6 +315,17 @@ class BD3LMSampler(BaseSampler):
         if steps_per_block is None:
             steps_per_block = math.ceil(steps / num_blocks)
         histories = [x.clone()] if return_dict else None
+        duel_diagnostics = []
+        duel_generator = (
+            _make_duel_generator(duel_mtm_cfg, self.model.device)
+            if duel_mtm_cfg.enabled
+            else None
+        )
+        duel_refiner = (
+            IntraBlockDuelMTM(self.model, duel_mtm_cfg, mask_id, self.tokenizer)
+            if duel_mtm_cfg.enabled
+            else None
+        )
 
         generated = 0  # number of generated tokens so far
 
@@ -361,6 +425,9 @@ class BD3LMSampler(BaseSampler):
             ]  # [B,1,L_q,T_total]
             pos_block = full_position_ids[:, T_prefix:T_total]  # [B,L_q]
 
+            # KLASS state for this block
+            prev_block_probs = None
+
             # ======================================================
             # 3) Inner diffusion loop within the current block
             # ======================================================
@@ -413,14 +480,21 @@ class BD3LMSampler(BaseSampler):
                     logits_block = shifted
 
                 # ---- One diffusion step over this block ----
-                x_block_updated = _diffusion_step_block(
+                x_block_updated, current_block_probs = _diffusion_step_block(
                     logits=logits_block,
                     x_block=x_block,
                     mask_block=mask_block,
                     num_transfer_step=num_transfer_tokens[:, i_step],
                     temperature=temperature,
                     remasking=remasking,
+                    threshold=threshold,
+                    kl_threshold=kl_threshold,
+                    prev_block_probs=prev_block_probs,
                 )
+
+                # Update KLASS state
+                if remasking == "klass" and current_block_probs is not None:
+                    prev_block_probs = current_block_probs
 
                 # Write back
                 x[:, T_prefix:T_total] = x_block_updated
@@ -433,6 +507,30 @@ class BD3LMSampler(BaseSampler):
                 eos_in_block = (x[:, T_prefix:T_total] == eos_id).any(dim=1)
                 done = done | eos_in_block
 
+            if duel_refiner is not None:
+                full_attention_mask, full_position_ids = _prepare_for_sampling(
+                    x=x,
+                    block_size=block_size,
+                    pad_token_id=pad_id,
+                )
+                for j in range(B):
+                    if done[j]:
+                        continue
+                    for _ in range(duel_mtm_cfg.num_mtm_steps_per_block):
+                        refined, diag = duel_refiner.step(
+                            current_state=x[j : j + 1],
+                            block_start=T_prefix,
+                            block_end=T_total,
+                            block_index=b_idx,
+                            attention_mask=full_attention_mask[j : j + 1],
+                            position_ids=full_position_ids[j : j + 1],
+                            generator=duel_generator,
+                        )
+                        x[j : j + 1] = refined
+                        duel_diagnostics.append(diag)
+                        if histories is not None:
+                            histories.append(x.clone())
+
             generated += cur_block_len
 
         # ==========================================================
@@ -441,7 +539,12 @@ class BD3LMSampler(BaseSampler):
         if not return_dict:
             return x
         else:
-            return BaseSamplerOutput(sequences=x, histories=histories)
+            if duel_mtm_cfg.enabled and duel_mtm_cfg.save_diagnostics:
+                save_diagnostics(duel_diagnostics, duel_mtm_cfg.diagnostics_path)
+            output = BaseSamplerOutput(sequences=x, histories=histories)
+            if duel_mtm_cfg.enabled:
+                output.duel_diagnostics = duel_diagnostics
+            return output
 
     @torch.no_grad()
     def infill(
