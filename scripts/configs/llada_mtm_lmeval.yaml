@@ -1,0 +1,133 @@
+# Run baseline LLaDA and DUEL-MTM variants through DLLM's own
+# lm-evaluation-harness integration.
+#
+# This mode can run any task available to your local lm-evaluation-harness
+# checkout.  Change lm_eval.tasks below to select datasets/benchmarks.
+#
+# Run:
+#   python scripts/compare_llada_mtm.py --config scripts/configs/llada_mtm_lmeval.yaml
+
+seed: 42
+
+lm_eval:
+  enabled: true
+
+  # DLLM eval entrypoint and registered lm-eval model name.
+  # Common options:
+  #   LLaDA: pipeline=dllm/pipelines/llada/eval.py, model=llada
+  #   Dream: pipeline=dllm/pipelines/dream/eval.py, model=dream
+  #   A2D MDLM: pipeline=dllm/pipelines/a2d/eval.py, model=a2d_mdlm
+  #   A2D BD3LM: pipeline=dllm/pipelines/a2d/eval.py, model=a2d_bd3lm
+  #   BERT-Chat: pipeline=dllm/pipelines/bert/eval.py, model=bert
+  pipeline: dllm/pipelines/llada/eval.py
+  model: llada
+  apply_chat_template: true
+
+  # Use accelerate launch by default. Set accelerate=false for python-only debug.
+  accelerate: true
+  num_gpu: 1
+  batch_size: null
+  dry_run: false
+  stop_on_error: true
+  output_dir: outputs/llada_mtm_lmeval
+
+  # Base model/sampler args inherited by every run and task. Task/run-specific
+  # overrides are merged on top.
+  model_args:
+    pretrained: GSAI-ML/LLaDA-8B-Instruct
+    max_new_tokens: 256
+    steps: 256
+    block_size: 32
+    cfg_scale: 0.0
+    suppress_tokens: []
+    begin_suppress_tokens: []
+
+  # Each task can be a string or a mapping. Use mappings when num_fewshot,
+  # batch_size, unsafe-code confirmation, or generation length differs.
+  tasks:
+    - name: gsm8k_cot
+      num_fewshot: 5
+      model_args:
+        max_new_tokens: 512
+        steps: 512
+        block_size: 512
+        begin_suppress_tokens: [126081, 126348]
+
+    - name: minerva_math
+      num_fewshot: 4
+      model_args:
+        max_new_tokens: 512
+        steps: 512
+        block_size: 512
+
+    - name: mmlu_generative
+      num_fewshot: 0
+      model_args:
+        max_new_tokens: 3
+        steps: 3
+        block_size: 3
+
+    # Code tasks execute generated code. Keep confirm_run_unsafe_code=true only
+    # when you intentionally want to run those official metrics.
+    # - name: humaneval_instruct_llada
+    #   num_fewshot: 0
+    #   confirm_run_unsafe_code: true
+    #   model_args:
+    #     max_new_tokens: 512
+    #     steps: 512
+    #     block_size: 512
+    #     suppress_tokens: [126081]
+    #     begin_suppress_tokens: []
+
+# Runs to compare. Baseline has no duel_mtm. MTM runs write their duel_mtm
+# block to outputs/llada_mtm_lmeval/duel_mtm_configs/<run>.yaml and pass it to
+# DLLM eval as model_args duel_mtm_config=<path>.
+runs:
+  - name: baseline_llada
+    seed: 42
+
+  - name: duel_mtm_exact_tprop_1
+    seed: 42
+    duel_mtm:
+      enabled: true
+      method: duel_mtm
+      exact_mtm: true
+      K: 4
+      alpha: 4.0
+      target_temperature: 1.0
+      proposal_temperature: 1.0
+      proposal_top_k: null
+      proposal_top_p: null
+      block_size: 32
+      num_mtm_steps_per_block: 1
+      unmask_rule: probability_margin
+      positions_per_step: 1
+      rollback_policy: fixed_ratio
+      rollback_ratio: 0.5
+      score_scope: rollback_region
+      seed: 42
+      save_diagnostics: false
+      diagnostics_path: outputs/duel_mtm_diagnostics.jsonl
+
+  - name: duel_mtm_exact_tprop_4
+    seed: 43
+    duel_mtm:
+      enabled: true
+      method: duel_mtm
+      exact_mtm: true
+      K: 4
+      alpha: 4.0
+      target_temperature: 1.0
+      proposal_temperature: 4.0
+      proposal_top_k: null
+      proposal_top_p: null
+      block_size: 32
+      num_mtm_steps_per_block: 1
+      unmask_rule: probability_margin
+      positions_per_step: 1
+      rollback_policy: fixed_ratio
+      rollback_ratio: 0.5
+      score_scope: rollback_region
+      seed: 43
+      save_diagnostics: false
+      diagnostics_path: outputs/duel_mtm_diagnostics.jsonl

@@ -7,10 +7,13 @@ Run: Not runnable directly; use pipeline eval entrypoints (e.g. dllm.pipelines.l
 """
 
 import dataclasses
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import accelerate
 import torch
+import yaml
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
 from tqdm import tqdm
@@ -52,6 +55,14 @@ class BaseEvalHarness(LM):
                 init[f.name] = getattr(source, f.name)
         return config_cls(**init)
 
+    @staticmethod
+    def _load_structured_config(path: str | Path):
+        path = Path(path).expanduser()
+        with path.open(encoding="utf-8") as f:
+            if path.suffix.lower() == ".json":
+                return json.load(f)
+            return yaml.safe_load(f)
+
     def __init__(
         self,
         eval_config: BaseEvalConfig | None = None,
@@ -66,6 +77,9 @@ class BaseEvalHarness(LM):
         model_args = model_args or ModelArguments(
             model_name_or_path=kwargs.get("pretrained")
         )
+        duel_mtm_config = kwargs.pop("duel_mtm_config", None)
+        if duel_mtm_config and kwargs.get("duel_mtm") is None:
+            kwargs["duel_mtm"] = self._load_structured_config(duel_mtm_config)
         device = kwargs.get("device", eval_config.device)
 
         # ── Distributed ──────────────────────────────────────────

@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -192,6 +194,165 @@ def _make_sampler_config(base_generation: dict[str, Any], run: dict[str, Any]):
     return dllm.core.samplers.MDLMSamplerConfig(**cfg)
 
 
+def _format_model_arg_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    if value is None:
+        return "None"
+    if isinstance(value, (list, tuple)):
+        return "[" + ";".join(str(item) for item in value) + "]"
+    return str(value)
+
+
+def _model_args_string(args_dict: dict[str, Any]) -> str:
+    return ",".join(
+        f"{key}={_format_model_arg_value(value)}"
+        for key, value in args_dict.items()
+        if value is not None
+    )
+
+
+def _normalise_lm_eval_tasks(tasks: list[Any]) -> list[dict[str, Any]]:
+    normalised = []
+    for task in tasks:
+        if isinstance(task, str):
+            normalised.append({"name": task})
+        elif isinstance(task, dict) and task.get("name"):
+            normalised.append(dict(task))
+        else:
+            raise TypeError("lm_eval.tasks entries must be strings or mappings with name")
+    return normalised
+
+
+def _write_duel_config(output_dir: Path, run_name: str, duel_cfg: dict[str, Any]) -> Path:
+    cfg_dir = output_dir / "duel_mtm_configs"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    path = cfg_dir / f"{run_name}.yaml"
+    with path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(duel_cfg, f, sort_keys=False, allow_unicode=True)
+    return path
+
+
+def _run_lm_eval_mode(cfg: dict[str, Any], config_path: Path) -> None:
+    """Run comparisons through DLLM's lm-evaluation-harness entrypoints."""
+    lm_cfg = cfg.get("lm_eval", {}) or {}
+    output_dir = Path(lm_cfg.get("output_dir", "outputs/llada_mtm_lmeval"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    pipeline = lm_cfg.get("pipeline", "dllm/pipelines/llada/eval.py")
+    model_name = lm_cfg.get("model", "llada")
+    tasks = _normalise_lm_eval_tasks(lm_cfg.get("tasks") or [])
+    if not tasks:
+        raise ValueError("lm_eval.tasks must contain at least one task")
+
+    num_gpu = int(lm_cfg.get("num_gpu", 1))
+    use_accelerate = bool(lm_cfg.get("accelerate", True))
+    dry_run = bool(lm_cfg.get("dry_run", False))
+    stop_on_error = bool(lm_cfg.get("stop_on_error", True))
+    apply_chat_template = bool(lm_cfg.get("apply_chat_template", True))
+    base_model_args = dict(lm_cfg.get("model_args", {}) or {})
+    base_model_args.update(lm_cfg.get("sampler_args", {}) or {})
+    if not base_model_args.get("pretrained"):
+        model_cfg = cfg.get("model", {}) or {}
+        pretrained = model_cfg.get("model_name_or_path") or model_cfg.get("pretrained")
+        if pretrained:
+            base_model_args["pretrained"] = pretrained
+    if not base_model_args.get("pretrained"):
+        raise ValueError("Set lm_eval.model_args.pretrained or model.model_name_or_path")
+
+    common_extra_args = [str(arg) for arg in (lm_cfg.get("extra_args") or [])]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{REPO_ROOT}:{env.get('PYTHONPATH', '')}"
+    env.setdefault("HF_ALLOW_CODE_EVAL", "1")
+    env.setdefault("HF_DATASETS_TRUST_REMOTE_CODE", "True")
+
+    runs = cfg.get("runs") or [{"name": "baseline_llada"}]
+    summary: dict[str, Any] = {
+        "config": str(config_path),
+        "mode": "lm_eval",
+        "output_dir": str(output_dir),
+        "commands": [],
+    }
+
+    for run_idx, raw_run in enumerate(runs):
+        run = dict(raw_run)
+        run_name = run.get("name", f"run_{run_idx}")
+        run_model_args = dict(base_model_args)
+        run_model_args.update(run.get("sampler", {}) or {})
+        if run.get("duel_mtm") is not None:
+            duel_path = _write_duel_config(output_dir, run_name, run["duel_mtm"])
+            run_model_args["duel_mtm_config"] = duel_path
+
+        for task_idx, task in enumerate(tasks):
+            task_name = task["name"]
+            task_model_args = dict(run_model_args)
+            task_model_args.update(task.get("model_args", {}) or {})
+            task_model_args_string = _model_args_string(task_model_args)
+            task_output_dir = output_dir / run_name / task_name
+            task_output_dir.mkdir(parents=True, exist_ok=True)
+
+            if use_accelerate:
+                cmd = [
+                    "accelerate",
+                    "launch",
+                    "--num_processes",
+                    str(num_gpu),
+                    pipeline,
+                ]
+            else:
+                cmd = [sys.executable, pipeline]
+            cmd.extend([
+                "--tasks",
+                task_name,
+                "--model",
+                model_name,
+                "--model_args",
+                task_model_args_string,
+                "--output_path",
+                str(task_output_dir),
+            ])
+            if apply_chat_template:
+                cmd.append("--apply_chat_template")
+            if task.get("num_fewshot", lm_cfg.get("num_fewshot")) is not None:
+                cmd.extend([
+                    "--num_fewshot",
+                    str(task.get("num_fewshot", lm_cfg.get("num_fewshot"))),
+                ])
+            batch_size = task.get("batch_size", lm_cfg.get("batch_size"))
+            if batch_size is not None:
+                cmd.extend(["--batch_size", str(batch_size)])
+            if task.get("confirm_run_unsafe_code", lm_cfg.get("confirm_run_unsafe_code", False)):
+                cmd.append("--confirm_run_unsafe_code")
+            cmd.extend([str(arg) for arg in (task.get("extra_args") or [])])
+            cmd.extend(common_extra_args)
+
+            record = {
+                "run": run_name,
+                "task": task_name,
+                "command": cmd,
+                "output_path": str(task_output_dir),
+            }
+            summary["commands"].append(record)
+            print(f"\n=== lm-eval [{run_name}] task={task_name} ===")
+            print(" ".join(cmd))
+            if dry_run:
+                record["returncode"] = None
+                continue
+
+            started = time.perf_counter()
+            proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env)
+            record["elapsed_sec"] = time.perf_counter() - started
+            record["returncode"] = proc.returncode
+            if proc.returncode != 0 and stop_on_error:
+                with (output_dir / "commands_summary.json").open("w", encoding="utf-8") as f:
+                    json.dump(summary, f, indent=2, ensure_ascii=False)
+                raise SystemExit(proc.returncode)
+
+    with (output_dir / "commands_summary.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    print(f"\nSaved lm-eval command summary to {output_dir / 'commands_summary.json'}")
+
+
 def _build_inputs(tokenizer, prompts: list[list[dict[str, str]]]):
     return tokenizer.apply_chat_template(
         prompts,
@@ -299,6 +460,12 @@ def main() -> None:
         cfg = yaml.safe_load(f)
     if not isinstance(cfg, dict):
         raise ValueError("YAML config must contain a mapping at the top level")
+
+    lm_eval_cfg = cfg.get("lm_eval", {}) or {}
+    if lm_eval_cfg.get("enabled", False):
+        _run_lm_eval_mode(cfg, Path(args.config))
+        return
+
     seed = int(cfg.get("seed", 42))
     _set_seed(seed)
 
