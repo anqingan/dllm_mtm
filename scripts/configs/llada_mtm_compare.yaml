@@ -1,66 +1,188 @@
-# Example config for scripts/compare_llada_mtm.py.
+# YAML config for scripts/compare_llada_mtm.py.
+#
+# This file has two input modes:
+#   1) prompts: small hand-written prompt list for quick qualitative comparison.
+#   2) dataset: Hugging Face/local dataset mode for running scores.
 #
 # Run:
 #   python scripts/compare_llada_mtm.py --config scripts/configs/llada_mtm_compare.yaml
 
+# Global seed. Used before model loading and as the default seed for runs.
 seed: 42
+
+# Number of examples per sampler.sample() call. Increase if GPU memory allows.
+eval_batch_size: 1
+
+# JSON output path. The file contains config, generations, scores, timings,
+# and DUEL diagnostics summaries.
 output_path: outputs/llada_mtm_compare.json
 
+# Model loading arguments passed to dllm.utils.get_model/get_tokenizer.
 model:
+  # Hugging Face model id or local checkpoint path.
   model_name_or_path: GSAI-ML/LLaDA-8B-Instruct
+  # Model dtype used by transformers loading. Common values: bfloat16, float16, float32.
   dtype: bfloat16
+  # Load with bitsandbytes 4-bit quantization if available.
   load_in_4bit: false
+  # Optional attention backend, e.g. flash_attention_2. null uses model default.
   attn_implementation: null
 
-generation:
-  max_new_tokens: 128
-  max_length: null
-  block_size: 32
-  steps: 128
-  temperature: 0.0
-  remasking: low_confidence
-  stochastic_transfer: false
-  cfg_scale: 0.0
-  cfg_keep_tokens: null
-  suppress_tokens: null
-  begin_suppress_tokens: null
-  right_shift_logits: false
-  threshold: null
-  kl_threshold: null
-  oracle_max_positions: 5
+# Dataset mode. Set enabled=true to ignore the prompts section and score a dataset.
+dataset:
+  # If false, the script uses the prompts list below.
+  enabled: false
+  # Hugging Face dataset path, local dataset script, or format loader such as json/csv.
+  # Examples:
+  #   path: gsm8k
+  #   name: main
+  #   path: json
+  #   data_files: /path/to/file.jsonl
+  path: gsm8k
+  # Optional dataset config/subset name. For gsm8k use "main".
+  name: main
+  # Dataset split to evaluate.
+  split: test
+  # Optional local files for loaders like json/csv.
+  data_files: null
+  # Optional revision for Hub datasets.
+  revision: null
+  # Limit examples for fast smoke tests. Set null for full split.
+  limit: 32
+  # Shuffle before limit. Useful for taking a random subset.
+  shuffle: false
+  # Seed used only when shuffle=true.
+  shuffle_seed: 42
 
+  # Prompt construction. Use exactly one of:
+  #   messages_field: row field already containing chat messages
+  #   prompt_template: Python format string using row fields, e.g. "{question}\nAnswer:"
+  #   prompt_field: row field used directly as the user message
+  messages_field: null
+  prompt_template: "Solve the problem. Give the final answer clearly.\n\n{question}"
+  prompt_field: null
+  # Optional system message prepended before the user prompt.
+  system_prompt: null
+
+  # Target construction for scoring. Use target_template or target_field.
+  # For GSM8K, answer contains "#### 42"; gsm8k_number extracts the last number.
+  target_template: null
+  target_field: answer
+
+# Hand-written prompts mode. Used only when dataset.enabled=false.
 prompts:
   - Lily runs 12 km/h for 4 hours. How far does she run in 8 hours?
   - Please write a short educational Python function that checks whether a number is prime.
 
+# Scoring configuration. Used for both dataset and prompt modes. If prompt mode
+# has no target, metric is recorded but no score is computed.
+scoring:
+  # Supported:
+  #   none          : no scoring, generation/timing only
+  #   exact_match   : prediction exactly equals target after normalization
+  #   contains      : normalized target appears inside normalized prediction
+  #   regex         : regex must match prediction; optionally compare group 1 to target
+  #   gsm8k_number  : compare last numeric value in prediction and target
+  metric: gsm8k_number
+  # Whether text comparison preserves case.
+  case_sensitive: false
+  # Whether to strip leading/trailing whitespace before comparison.
+  strip: true
+  # Regex pattern used only when metric=regex.
+  regex: null
+  # If true with metric=regex, group(1) must equal target.
+  regex_compare_target: false
+  # If true, each output JSON item includes the original dataset row.
+  include_rows: false
+
+# Base generation arguments for MDLMSamplerConfig. Every run inherits these.
+generation:
+  # Number of new tokens to generate.
+  max_new_tokens: 128
+  # Optional total sequence length. Usually null when max_new_tokens is set.
+  max_length: null
+  # Diffusion block size.
+  block_size: 32
+  # Total denoising steps. The sampler distributes them per block.
+  steps: 128
+  # Baseline token sampling/Gumbel temperature for the original sampler.
+  temperature: 0.0
+  # Position remasking/selection rule for original sampling.
+  # Common values: low_confidence, random, left_to_right, probability_margin,
+  # confidence_threshold, klass, oracle.
+  remasking: low_confidence
+  # Whether transfer-token counts are sampled stochastically by the scheduler.
+  stochastic_transfer: false
+  # Classifier-free guidance scale. 0 disables CFG.
+  cfg_scale: 0.0
+  # Token ids kept in the conditional branch when CFG is enabled.
+  cfg_keep_tokens: null
+  # Token ids suppressed everywhere during generation.
+  suppress_tokens: null
+  # Token ids suppressed at the beginning of generation.
+  begin_suppress_tokens: null
+  # Whether to right-shift logits for AR-style token prediction.
+  right_shift_logits: false
+  # Confidence threshold for confidence_threshold/klass remasking.
+  threshold: null
+  # KL threshold for klass remasking.
+  kl_threshold: null
+  # Max positions for oracle enumeration before fallback.
+  oracle_max_positions: 5
+
+# Runs to compare. A run without duel_mtm is the original LLaDA/MDLM baseline.
 runs:
   - name: baseline_llada
+    # Per-run seed. If omitted, defaults to global seed + run index.
     seed: 42
 
   - name: duel_mtm_exact_tprop_1
     seed: 42
+    # Optional sampler overrides for this run, merged on top of generation.
+    sampler: {}
     duel_mtm:
+      # Enable DUEL Intra-Block MTM refinement after each generated block.
       enabled: true
+      # Exact MTM method. duel_rerank is heuristic and requires exact_mtm=false.
       method: duel_mtm
+      # If true, forbid heuristic settings such as random rollback or rerank.
       exact_mtm: true
+      # Number of multiple-try forward proposals.
       K: 4
+      # Target exponent: pi(x) proportional to p_target,DUEL(x)^alpha.
       alpha: 4.0
+      # Temperature used by target DUEL likelihood log p_target,DUEL.
       target_temperature: 1.0
+      # Temperature used by proposal q_Tprop.
       proposal_temperature: 1.0
+      # Optional proposal truncation. If set, log q uses the truncated,
+      # renormalized proposal distribution.
       proposal_top_k: null
       proposal_top_p: null
+      # MTM block size metadata.
       block_size: 32
+      # Number of MTM refinement steps per generated block.
       num_mtm_steps_per_block: 1
+      # Deterministic DUEL unmask path F.
       unmask_rule: probability_margin
+      # Number of positions revealed per DUEL proposal/scoring step.
       positions_per_step: 1
+      # fixed_ratio is deterministic; uniform_step is rejected in exact_mtm mode.
       rollback_policy: fixed_ratio
+      # Fraction of current block to re-mask before proposing candidates.
       rollback_ratio: 0.5
+      # Positions included in target likelihood: rollback_region or full_block.
       score_scope: rollback_region
+      # Seed for the MTM generator.
       seed: 42
+      # Save per-step diagnostics JSONL.
       save_diagnostics: false
+      # Path used only when save_diagnostics=true.
+      diagnostics_path: outputs/duel_mtm_diagnostics.jsonl
 
   - name: duel_mtm_exact_tprop_4
     seed: 43
+    sampler: {}
     duel_mtm:
       enabled: true
       method: duel_mtm
@@ -80,3 +202,4 @@ runs:
       score_scope: rollback_region
       seed: 43
       save_diagnostics: false
+      diagnostics_path: outputs/duel_mtm_diagnostics.jsonl
