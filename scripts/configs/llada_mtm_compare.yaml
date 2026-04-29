@@ -1,0 +1,82 @@
+# Example config for scripts/compare_llada_mtm.py.
+#
+# Run:
+#   python scripts/compare_llada_mtm.py --config scripts/configs/llada_mtm_compare.yaml
+
+seed: 42
+output_path: outputs/llada_mtm_compare.json
+
+model:
+  model_name_or_path: GSAI-ML/LLaDA-8B-Instruct
+  dtype: bfloat16
+  load_in_4bit: false
+  attn_implementation: null
+
+generation:
+  max_new_tokens: 128
+  max_length: null
+  block_size: 32
+  steps: 128
+  temperature: 0.0
+  remasking: low_confidence
+  stochastic_transfer: false
+  cfg_scale: 0.0
+  cfg_keep_tokens: null
+  suppress_tokens: null
+  begin_suppress_tokens: null
+  right_shift_logits: false
+  threshold: null
+  kl_threshold: null
+  oracle_max_positions: 5
+
+prompts:
+  - Lily runs 12 km/h for 4 hours. How far does she run in 8 hours?
+  - Please write a short educational Python function that checks whether a number is prime.
+
+runs:
+  - name: baseline_llada
+    seed: 42
+
+  - name: duel_mtm_exact_tprop_1
+    seed: 42
+    duel_mtm:
+      enabled: true
+      method: duel_mtm
+      exact_mtm: true
+      K: 4
+      alpha: 4.0
+      target_temperature: 1.0
+      proposal_temperature: 1.0
+      proposal_top_k: null
+      proposal_top_p: null
+      block_size: 32
+      num_mtm_steps_per_block: 1
+      unmask_rule: probability_margin
+      positions_per_step: 1
+      rollback_policy: fixed_ratio
+      rollback_ratio: 0.5
+      score_scope: rollback_region
+      seed: 42
+      save_diagnostics: false
+
+  - name: duel_mtm_exact_tprop_4
+    seed: 43
+    duel_mtm:
+      enabled: true
+      method: duel_mtm
+      exact_mtm: true
+      K: 4
+      alpha: 4.0
+      target_temperature: 1.0
+      proposal_temperature: 4.0
+      proposal_top_k: null
+      proposal_top_p: null
+      block_size: 32
+      num_mtm_steps_per_block: 1
+      unmask_rule: probability_margin
+      positions_per_step: 1
+      rollback_policy: fixed_ratio
+      rollback_ratio: 0.5
+      score_scope: rollback_region
+      seed: 43
+      save_diagnostics: false
